@@ -84,6 +84,30 @@ def transform_heart_rate(response: Optional[dict], user_id: str) -> list[dict]:
                 "deviceUsed": "Fitbit",
                 "sourceId": _source_id(act, date, kind="heart-rate"),
             })
+            continue
+        # Daily summary often has zones but no restingHeartRate — still emit vitals for webhooks/sync.
+        zones = value.get("heartRateZones") or []
+        if not isinstance(zones, list):
+            zones = []
+        for z in zones:
+            if not isinstance(z, dict):
+                continue
+            try:
+                mins = float(z.get("minutes") or 0)
+            except (TypeError, ValueError):
+                mins = 0.0
+            if mins <= 0:
+                continue
+            zname = str(z.get("name") or "zone").strip().replace(" ", "-").lower()[:48]
+            if not zname:
+                zname = "zone"
+            out.append({
+                "vitals": [{"vitalType": "heart-rate-zone", "value": round(mins, 2), "units": zname}],
+                "recordedAt": _iso(date),
+                "recordedBy": "Fitbit",
+                "deviceUsed": "Fitbit",
+                "sourceId": _source_id(act, f"{date}_{zname}", kind="heart-rate-zone"),
+            })
     return out
 
 

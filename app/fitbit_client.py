@@ -1,6 +1,7 @@
 import requests
 import base64
 import logging
+import threading
 from flask import current_app
 from .auth import generate_pkce
 from . import db
@@ -8,6 +9,9 @@ import time
 import json
 
 logger = logging.getLogger(__name__)
+
+# Serialize Fitbit OAuth refresh + Dynamo persistence when many parallel GETs hit 401.
+_fitbit_oauth_lock = threading.Lock()
 
 def _basic_auth_header(client_id, client_secret):
     creds = f"{client_id}:{client_secret}"
@@ -61,23 +65,49 @@ def _get_with_retry(url, access_token, user_obj=None):
     headers = {'Authorization': f'Bearer {access_token}'}
     resp = requests.get(url, headers=headers, timeout=45)
     logger.debug("GET %s -> %s", url, resp.status_code)
-    if resp.status_code == 401 and user_obj:
-        # try refresh once
-        refreshed = refresh_access_token(user_obj.refresh_token)
-        if 'access_token' in refreshed:
-            new_access = refreshed['access_token']
-            new_refresh = refreshed.get('refresh_token', user_obj.refresh_token)
-            # update user in DB
+    if resp.status_code == 401 and user_obj and getattr(user_obj, "refresh_token", None):
+        with _fitbit_oauth_lock:
+            # Another thread may have refreshed already — retry with latest bearer first.
+            latest = getattr(user_obj, "access_token", None) or access_token
+            headers = {"Authorization": f"Bearer {latest}"}
+            resp = requests.get(url, headers=headers, timeout=45)
+            logger.debug("GET after lock (maybe refreshed peer) %s -> %s", url, resp.status_code)
+            if resp.status_code != 401:
+                return resp
+            refreshed = refresh_access_token(user_obj.refresh_token)
+            if "access_token" not in refreshed:
+                logger.warning("Fitbit token refresh failed for GET %s", url[:120])
+                return resp
+            new_access = refreshed["access_token"]
+            new_refresh = refreshed.get("refresh_token", user_obj.refresh_token)
             user_obj.access_token = new_access
             user_obj.refresh_token = new_refresh
+            cognito_id = getattr(user_obj, "cognito_user_id", None)
+            if cognito_id:
+                try:
+                    from . import dynamodb_client
+
+                    dynamodb_client.save_tokens(
+                        str(cognito_id),
+                        new_access,
+                        new_refresh,
+                        int(refreshed.get("expires_in", 28800)),
+                        fitbit_user_id=getattr(user_obj, "fitbit_user_id", None),
+                    )
+                    logger.info("Persisted Fitbit refresh to DynamoDB for user %s", str(cognito_id)[:8])
+                except Exception as e:
+                    logger.warning("DynamoDB save_tokens after Fitbit refresh failed: %s", e)
             try:
-                db.session.add(user_obj)
-                db.session.commit()
-                logger.info("Updated user tokens in DB after refresh")
+                from .models import User
+
+                if isinstance(user_obj, User):
+                    db.session.add(user_obj)
+                    db.session.commit()
+                    logger.info("Updated user tokens in SQLite after refresh")
             except Exception as e:
                 db.session.rollback()
                 logger.warning("DB commit error updating tokens: %s", e)
-            headers = {'Authorization': f'Bearer {new_access}'}
+            headers = {"Authorization": f"Bearer {new_access}"}
             resp = requests.get(url, headers=headers, timeout=45)
             logger.debug("RETRY GET %s -> %s", url, resp.status_code)
     return resp

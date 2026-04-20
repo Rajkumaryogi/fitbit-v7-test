@@ -3,10 +3,12 @@ from flask_cors import cross_origin  # Add this import
 from .auth import generate_pkce, build_auth_url
 import os
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import traceback
+from typing import Optional, Set
 
 from .fitbit_client import (
+    _date_str,
     exchange_code_for_tokens,
     fetch_heart_rate,
     fetch_sleep,
@@ -316,6 +318,7 @@ def sync_fitbit_data():
                 access_token=item['access_token'],
                 refresh_token=item.get('refresh_token') or '',
                 last_sync=None,
+                cognito_user_id=str(cognito_user_id),
             )
             success, parsed_data = _fetch_and_store_fitbit_data(dyn_user)
             rows_written = 0
@@ -383,7 +386,9 @@ def sync_fitbit_data():
         return jsonify({'success': False, 'error': _client_safe_error_detail(e, 500)}), 500
 
 
-def _sync_fitbit_dynamo_user_worker(cognito_user_id: str) -> None:
+def _sync_fitbit_dynamo_user_worker(
+    cognito_user_id: str, extra_notification_dates: Optional[Set[str]] = None
+) -> None:
     """Background sync for one Cognito user (Fitbit Subscriber / webhook)."""
     try:
         item = dynamodb_client.get_tokens(cognito_user_id)
@@ -404,8 +409,11 @@ def _sync_fitbit_dynamo_user_worker(cognito_user_id: str) -> None:
             access_token=item['access_token'],
             refresh_token=item.get('refresh_token') or '',
             last_sync=None,
+            cognito_user_id=str(cognito_user_id),
         )
-        success, parsed_data = _fetch_and_store_fitbit_data(dyn_user)
+        success, parsed_data = _fetch_and_store_fitbit_data(
+            dyn_user, extra_fetch_dates=extra_notification_dates
+        )
         if success and parsed_data:
             try:
                 import time as _time
@@ -488,7 +496,8 @@ def fitbit_subscriber_webhook():
                 'Fitbit webhook: POST had body (%d bytes) but parsed 0 notifications; check Content-Type/JSON',
                 len(request.data or b''),
             )
-        owner_ids = set()
+        owner_ids: Set[str] = set()
+        owner_notification_dates: dict[str, Set[str]] = {}
         for n in notifications:
             if not isinstance(n, dict):
                 continue
@@ -497,6 +506,9 @@ def fitbit_subscriber_webhook():
             if oid is None or (isinstance(oid, str) and not oid.strip()):
                 continue
             oid_s = str(oid).strip()
+            nd = n.get("date")
+            if nd and isinstance(nd, str) and len(nd.strip()) >= 10:
+                owner_notification_dates.setdefault(oid_s, set()).add(nd.strip()[:10])
             if col == 'userRevokedAccess':
                 cid = dynamodb_client.get_cognito_id_by_fitbit_owner_id(oid_s)
                 if cid:
@@ -524,7 +536,8 @@ def fitbit_subscriber_webhook():
                 for oid in owner_ids:
                     cid = dynamodb_client.get_cognito_id_by_fitbit_owner_id(oid)
                     if cid:
-                        _sync_fitbit_dynamo_user_worker(cid)
+                        extra_dates = owner_notification_dates.get(oid) or None
+                        _sync_fitbit_dynamo_user_worker(cid, extra_notification_dates=extra_dates)
                     else:
                         logger.warning('Fitbit webhook: no DynamoDB Fitbit row for ownerId=%s', oid[:12])
 
@@ -687,13 +700,84 @@ def _merge_hydration(yesterday_d, today_d):
     return rows
 
 
+def _fitbit_notification_dates_expand(dates: Set[str]) -> Set[str]:
+    """Include each date plus the prior calendar day (Fitbit often ties updates across midnight)."""
+    out: set[str] = set()
+    for raw in dates or ():
+        ds = (str(raw).strip()[:10] if raw else "") or ""
+        if len(ds) != 10 or ds[4] != "-" or ds[7] != "-":
+            continue
+        out.add(ds)
+        try:
+            prev = (datetime.fromisoformat(ds).date() - timedelta(days=1)).isoformat()
+            out.add(prev)
+        except ValueError:
+            pass
+    return out
+
+
+def _fitbit_merge_notification_dates(parsed: dict, user, parse_response, dates: Optional[Set[str]]) -> dict:
+    """Merge extra calendar days from Fitbit subscription ``date`` fields (beyond server UTC today/yesterday)."""
+    if not dates:
+        return parsed
+    today_s = _date_str("today")
+    yest_s = _date_str("yesterday")
+    expanded = _fitbit_notification_dates_expand(dates)
+    out = dict(parsed)
+    for ds in sorted(expanded):
+        if ds in (today_s, yest_s):
+            continue
+        tok = user.access_token
+        sd = parse_response(fetch_steps(tok, user, date=ds))
+        out["steps_data"] = _merge_list_field(
+            out.get("steps_data"), sd if isinstance(sd, dict) else {}, "activities-steps"
+        )
+        hd = parse_response(fetch_heart_rate(tok, user, date=ds))
+        out["hr_data"] = _merge_list_field(
+            out.get("hr_data"), hd if isinstance(hd, dict) else {}, "activities-heart"
+        )
+        sl = parse_response(fetch_sleep(tok, user, date=ds))
+        if isinstance(sl, dict) and sl.get("sleep"):
+            prev = out.get("sleep_data") or {}
+            if not isinstance(prev, dict):
+                prev = {}
+            merged_sleep = (prev.get("sleep") or []) + (sl.get("sleep") or [])
+            out["sleep_data"] = {**prev, **sl, "sleep": merged_sleep}
+        wt = parse_response(fetch_weight(tok, user, date=ds))
+        out["weight_data"] = _merge_list_field(
+            out.get("weight_data"), wt if isinstance(wt, dict) else {}, "weight"
+        )
+    return out
+
+
 def _save_fitbit_to_user_vitals(cognito_user_id: str, parsed_data: dict) -> int:
     """Transform Fitbit API payloads and upsert rows into DynamoDB user_vitals (vitals7api-vitals schema)."""
     if not cognito_user_id or not parsed_data:
         return 0
+    err_keys = []
+    if logger.isEnabledFor(logging.DEBUG):
+        for k, v in (parsed_data or {}).items():
+            if isinstance(v, dict) and v.get("errors"):
+                err_keys.append(k)
+        if err_keys:
+            logger.debug("Fitbit merged payload contains errors key(s): %s", ", ".join(err_keys[:12]))
     payloads = fitbit_to_vitals7.all_payloads(user_id=cognito_user_id, **parsed_data)
+    if not payloads:
+        for k, v in (parsed_data or {}).items():
+            if isinstance(v, dict) and v.get("errors"):
+                logger.warning(
+                    "Fitbit → user_vitals: 0 payloads; merged field %s includes Fitbit errors: %s",
+                    k,
+                    str(v.get("errors"))[:400],
+                )
+                break
+    logger.info(
+        "Fitbit → user_vitals: normalized %d payload(s) for user %s",
+        len(payloads),
+        str(cognito_user_id)[:8],
+    )
     n = dynamodb_client.save_payloads_to_user_vitals(cognito_user_id, payloads)
-    logger.info("Fitbit → user_vitals: %d row(s) for user %s", n, str(cognito_user_id)[:8])
+    logger.info("Fitbit → user_vitals: %d row(s) written for user %s", n, str(cognito_user_id)[:8])
     return n
 
 
@@ -786,49 +870,52 @@ def _fitbit_merge_raw_responses(raw: dict) -> dict:
     }
 
 
-def _fitbit_download_parallel(flask_app, tok, user, parse_response) -> dict:
-    """Issue many Fitbit GETs concurrently (DynamoDB / Vitals7 flow uses SimpleNamespace user — no SQLAlchemy races)."""
+def _fitbit_download_parallel(flask_app, user, parse_response) -> dict:
+    """Issue many Fitbit GETs concurrently; always read ``user.access_token`` so OAuth refresh updates apply."""
     max_w = max(4, min(20, int(os.getenv("FITBIT_FETCH_PARALLELISM", "12"))))
 
     def run(thunk):
         with flask_app.app_context():
             return thunk()
 
+    def _tok():
+        return user.access_token
+
     tasks = [
-        ("hr_y", lambda: parse_response(fetch_heart_rate(tok, user, date="yesterday"))),
-        ("hr_t", lambda: parse_response(fetch_heart_rate(tok, user, date="today"))),
-        ("sleep_today", lambda: parse_response(fetch_sleep(tok, user, date="today"))),
-        ("sleep_yesterday", lambda: parse_response(fetch_sleep(tok, user, date="yesterday"))),
-        ("steps_y", lambda: parse_response(fetch_steps(tok, user, date="yesterday"))),
-        ("steps_t", lambda: parse_response(fetch_steps(tok, user, date="today"))),
-        ("weight_today", lambda: parse_response(fetch_weight(tok, user, date="today"))),
-        ("weight_yesterday", lambda: parse_response(fetch_weight(tok, user, date="yesterday"))),
-        ("activities", lambda: parse_response(fetch_activities(tok, user)) or {}),
-        ("nutrition_y", lambda: parse_response(fetch_nutrition(tok, user, date="yesterday"))),
-        ("nutrition_t", lambda: parse_response(fetch_nutrition(tok, user, date="today"))),
-        ("hydration_y", lambda: parse_response(fetch_hydration(tok, user, date="yesterday"))),
-        ("hydration_t", lambda: parse_response(fetch_hydration(tok, user, date="today"))),
-        ("bp_y", lambda: parse_response(fetch_blood_pressure(tok, user, date="yesterday"))),
-        ("bp_t", lambda: parse_response(fetch_blood_pressure(tok, user, date="today"))),
-        ("bodyfat_y", lambda: parse_response(fetch_body_fat(tok, user, date="yesterday"))),
-        ("bodyfat_t", lambda: parse_response(fetch_body_fat(tok, user, date="today"))),
-        ("oxygen_y", lambda: parse_response(fetch_oxygen_saturation(tok, user, date="yesterday"))),
-        ("oxygen_t", lambda: parse_response(fetch_oxygen_saturation(tok, user, date="today"))),
-        ("resp_y", lambda: parse_response(fetch_respiratory_rate(tok, user, date="yesterday"))),
-        ("resp_t", lambda: parse_response(fetch_respiratory_rate(tok, user, date="today"))),
-        ("temp_y", lambda: parse_response(fetch_temperature(tok, user, date="yesterday")) or {}),
-        ("temp_t", lambda: parse_response(fetch_temperature(tok, user, date="today")) or {}),
-        ("vo2_y", lambda: parse_response(fetch_vo2_max(tok, user, date="yesterday"))),
-        ("vo2_t", lambda: parse_response(fetch_vo2_max(tok, user, date="today"))),
-        ("hrv_y", lambda: parse_response(fetch_hrv(tok, user, date="yesterday"))),
-        ("hrv_t", lambda: parse_response(fetch_hrv(tok, user, date="today"))),
-        ("ecg", lambda: parse_response(fetch_ecg(tok, user))),
-        ("azm_y", lambda: parse_response(fetch_active_zone_minutes(tok, user, date="yesterday"))),
-        ("azm_t", lambda: parse_response(fetch_active_zone_minutes(tok, user, date="today"))),
-        ("bg_y", lambda: parse_response(fetch_blood_glucose(tok, user, date="yesterday")) or {}),
-        ("bg_t", lambda: parse_response(fetch_blood_glucose(tok, user, date="today")) or {}),
-        ("irn", lambda: parse_response(fetch_irn_alerts(tok, user))),
-        ("devices", lambda: parse_response(fetch_devices(tok, user))),
+        ("hr_y", lambda: parse_response(fetch_heart_rate(_tok(), user, date="yesterday"))),
+        ("hr_t", lambda: parse_response(fetch_heart_rate(_tok(), user, date="today"))),
+        ("sleep_today", lambda: parse_response(fetch_sleep(_tok(), user, date="today"))),
+        ("sleep_yesterday", lambda: parse_response(fetch_sleep(_tok(), user, date="yesterday"))),
+        ("steps_y", lambda: parse_response(fetch_steps(_tok(), user, date="yesterday"))),
+        ("steps_t", lambda: parse_response(fetch_steps(_tok(), user, date="today"))),
+        ("weight_today", lambda: parse_response(fetch_weight(_tok(), user, date="today"))),
+        ("weight_yesterday", lambda: parse_response(fetch_weight(_tok(), user, date="yesterday"))),
+        ("activities", lambda: parse_response(fetch_activities(_tok(), user)) or {}),
+        ("nutrition_y", lambda: parse_response(fetch_nutrition(_tok(), user, date="yesterday"))),
+        ("nutrition_t", lambda: parse_response(fetch_nutrition(_tok(), user, date="today"))),
+        ("hydration_y", lambda: parse_response(fetch_hydration(_tok(), user, date="yesterday"))),
+        ("hydration_t", lambda: parse_response(fetch_hydration(_tok(), user, date="today"))),
+        ("bp_y", lambda: parse_response(fetch_blood_pressure(_tok(), user, date="yesterday"))),
+        ("bp_t", lambda: parse_response(fetch_blood_pressure(_tok(), user, date="today"))),
+        ("bodyfat_y", lambda: parse_response(fetch_body_fat(_tok(), user, date="yesterday"))),
+        ("bodyfat_t", lambda: parse_response(fetch_body_fat(_tok(), user, date="today"))),
+        ("oxygen_y", lambda: parse_response(fetch_oxygen_saturation(_tok(), user, date="yesterday"))),
+        ("oxygen_t", lambda: parse_response(fetch_oxygen_saturation(_tok(), user, date="today"))),
+        ("resp_y", lambda: parse_response(fetch_respiratory_rate(_tok(), user, date="yesterday"))),
+        ("resp_t", lambda: parse_response(fetch_respiratory_rate(_tok(), user, date="today"))),
+        ("temp_y", lambda: parse_response(fetch_temperature(_tok(), user, date="yesterday")) or {}),
+        ("temp_t", lambda: parse_response(fetch_temperature(_tok(), user, date="today")) or {}),
+        ("vo2_y", lambda: parse_response(fetch_vo2_max(_tok(), user, date="yesterday"))),
+        ("vo2_t", lambda: parse_response(fetch_vo2_max(_tok(), user, date="today"))),
+        ("hrv_y", lambda: parse_response(fetch_hrv(_tok(), user, date="yesterday"))),
+        ("hrv_t", lambda: parse_response(fetch_hrv(_tok(), user, date="today"))),
+        ("ecg", lambda: parse_response(fetch_ecg(_tok(), user))),
+        ("azm_y", lambda: parse_response(fetch_active_zone_minutes(_tok(), user, date="yesterday"))),
+        ("azm_t", lambda: parse_response(fetch_active_zone_minutes(_tok(), user, date="today"))),
+        ("bg_y", lambda: parse_response(fetch_blood_glucose(_tok(), user, date="yesterday")) or {}),
+        ("bg_t", lambda: parse_response(fetch_blood_glucose(_tok(), user, date="today")) or {}),
+        ("irn", lambda: parse_response(fetch_irn_alerts(_tok(), user))),
+        ("devices", lambda: parse_response(fetch_devices(_tok(), user))),
     ]
     out: dict = {}
     with ThreadPoolExecutor(max_workers=max_w) as ex:
@@ -843,13 +930,20 @@ def _fitbit_download_parallel(flask_app, tok, user, parse_response) -> dict:
     return out
 
 
-def _fetch_and_store_fitbit_data(user):
+def _fetch_and_store_fitbit_data(user, extra_fetch_dates: Optional[Set[str]] = None):
     """Fetch all Fitbit data types; merge today + yesterday where the API is date-scoped (same pattern as sleep/weight)."""
     try:
         def parse_response(resp):
             if resp is None:
                 return None
             try:
+                sc = getattr(resp, "status_code", None)
+                if sc is not None and sc >= 400:
+                    url = getattr(resp, "url", "") or ""
+                    logger.warning(
+                        "Fitbit API HTTP %s for %s", sc, (url[:160] + "...") if len(url) > 160 else url
+                    )
+                    return None
                 if hasattr(resp, "json"):
                     return resp.json()
                 return resp
@@ -857,50 +951,53 @@ def _fetch_and_store_fitbit_data(user):
                 logger.error("Parse JSON error: %s", e)
                 return None
 
-        tok = user.access_token
+        def _tok():
+            return user.access_token
 
         # Parallel Fitbit HTTP for Dynamo-only user objects (no concurrent SQLAlchemy token refresh).
         if isinstance(user, SimpleNamespace):
-            raw = _fitbit_download_parallel(app._get_current_object(), tok, user, parse_response)
+            raw = _fitbit_download_parallel(app._get_current_object(), user, parse_response)
         else:
             raw = {
-                "hr_y": parse_response(fetch_heart_rate(tok, user, date="yesterday")),
-                "hr_t": parse_response(fetch_heart_rate(tok, user, date="today")),
-                "sleep_today": parse_response(fetch_sleep(tok, user, date="today")),
-                "sleep_yesterday": parse_response(fetch_sleep(tok, user, date="yesterday")),
-                "steps_y": parse_response(fetch_steps(tok, user, date="yesterday")),
-                "steps_t": parse_response(fetch_steps(tok, user, date="today")),
-                "weight_today": parse_response(fetch_weight(tok, user, date="today")),
-                "weight_yesterday": parse_response(fetch_weight(tok, user, date="yesterday")),
-                "activities": parse_response(fetch_activities(tok, user)) or {},
-                "nutrition_y": parse_response(fetch_nutrition(tok, user, date="yesterday")),
-                "nutrition_t": parse_response(fetch_nutrition(tok, user, date="today")),
-                "hydration_y": parse_response(fetch_hydration(tok, user, date="yesterday")),
-                "hydration_t": parse_response(fetch_hydration(tok, user, date="today")),
-                "bp_y": parse_response(fetch_blood_pressure(tok, user, date="yesterday")),
-                "bp_t": parse_response(fetch_blood_pressure(tok, user, date="today")),
-                "bodyfat_y": parse_response(fetch_body_fat(tok, user, date="yesterday")),
-                "bodyfat_t": parse_response(fetch_body_fat(tok, user, date="today")),
-                "oxygen_y": parse_response(fetch_oxygen_saturation(tok, user, date="yesterday")),
-                "oxygen_t": parse_response(fetch_oxygen_saturation(tok, user, date="today")),
-                "resp_y": parse_response(fetch_respiratory_rate(tok, user, date="yesterday")),
-                "resp_t": parse_response(fetch_respiratory_rate(tok, user, date="today")),
-                "temp_y": parse_response(fetch_temperature(tok, user, date="yesterday")) or {},
-                "temp_t": parse_response(fetch_temperature(tok, user, date="today")) or {},
-                "vo2_y": parse_response(fetch_vo2_max(tok, user, date="yesterday")),
-                "vo2_t": parse_response(fetch_vo2_max(tok, user, date="today")),
-                "hrv_y": parse_response(fetch_hrv(tok, user, date="yesterday")),
-                "hrv_t": parse_response(fetch_hrv(tok, user, date="today")),
-                "ecg": parse_response(fetch_ecg(tok, user)),
-                "azm_y": parse_response(fetch_active_zone_minutes(tok, user, date="yesterday")),
-                "azm_t": parse_response(fetch_active_zone_minutes(tok, user, date="today")),
-                "bg_y": parse_response(fetch_blood_glucose(tok, user, date="yesterday")) or {},
-                "bg_t": parse_response(fetch_blood_glucose(tok, user, date="today")) or {},
-                "irn": parse_response(fetch_irn_alerts(tok, user)),
-                "devices": parse_response(fetch_devices(tok, user)),
+                "hr_y": parse_response(fetch_heart_rate(_tok(), user, date="yesterday")),
+                "hr_t": parse_response(fetch_heart_rate(_tok(), user, date="today")),
+                "sleep_today": parse_response(fetch_sleep(_tok(), user, date="today")),
+                "sleep_yesterday": parse_response(fetch_sleep(_tok(), user, date="yesterday")),
+                "steps_y": parse_response(fetch_steps(_tok(), user, date="yesterday")),
+                "steps_t": parse_response(fetch_steps(_tok(), user, date="today")),
+                "weight_today": parse_response(fetch_weight(_tok(), user, date="today")),
+                "weight_yesterday": parse_response(fetch_weight(_tok(), user, date="yesterday")),
+                "activities": parse_response(fetch_activities(_tok(), user)) or {},
+                "nutrition_y": parse_response(fetch_nutrition(_tok(), user, date="yesterday")),
+                "nutrition_t": parse_response(fetch_nutrition(_tok(), user, date="today")),
+                "hydration_y": parse_response(fetch_hydration(_tok(), user, date="yesterday")),
+                "hydration_t": parse_response(fetch_hydration(_tok(), user, date="today")),
+                "bp_y": parse_response(fetch_blood_pressure(_tok(), user, date="yesterday")),
+                "bp_t": parse_response(fetch_blood_pressure(_tok(), user, date="today")),
+                "bodyfat_y": parse_response(fetch_body_fat(_tok(), user, date="yesterday")),
+                "bodyfat_t": parse_response(fetch_body_fat(_tok(), user, date="today")),
+                "oxygen_y": parse_response(fetch_oxygen_saturation(_tok(), user, date="yesterday")),
+                "oxygen_t": parse_response(fetch_oxygen_saturation(_tok(), user, date="today")),
+                "resp_y": parse_response(fetch_respiratory_rate(_tok(), user, date="yesterday")),
+                "resp_t": parse_response(fetch_respiratory_rate(_tok(), user, date="today")),
+                "temp_y": parse_response(fetch_temperature(_tok(), user, date="yesterday")) or {},
+                "temp_t": parse_response(fetch_temperature(_tok(), user, date="today")) or {},
+                "vo2_y": parse_response(fetch_vo2_max(_tok(), user, date="yesterday")),
+                "vo2_t": parse_response(fetch_vo2_max(_tok(), user, date="today")),
+                "hrv_y": parse_response(fetch_hrv(_tok(), user, date="yesterday")),
+                "hrv_t": parse_response(fetch_hrv(_tok(), user, date="today")),
+                "ecg": parse_response(fetch_ecg(_tok(), user)),
+                "azm_y": parse_response(fetch_active_zone_minutes(_tok(), user, date="yesterday")),
+                "azm_t": parse_response(fetch_active_zone_minutes(_tok(), user, date="today")),
+                "bg_y": parse_response(fetch_blood_glucose(_tok(), user, date="yesterday")) or {},
+                "bg_t": parse_response(fetch_blood_glucose(_tok(), user, date="today")) or {},
+                "irn": parse_response(fetch_irn_alerts(_tok(), user)),
+                "devices": parse_response(fetch_devices(_tok(), user)),
             }
 
         parsed = _fitbit_merge_raw_responses(raw)
+        if extra_fetch_dates:
+            parsed = _fitbit_merge_notification_dates(parsed, user, parse_response, extra_fetch_dates)
         return True, parsed
     except Exception as e:
         logger.error("Error fetching Fitbit data: %s", e)

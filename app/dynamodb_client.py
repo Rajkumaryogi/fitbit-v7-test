@@ -253,6 +253,8 @@ def save_payloads_to_user_vitals(cognito_user_id: str, payloads: list[dict]) -> 
     Uses batch_get_item + batch_writer instead of per-row get+put (orders of magnitude fewer round trips).
     """
     if not cognito_user_id or not payloads:
+        if cognito_user_id and not payloads:
+            logger.info("user_vitals save: 0 payloads (nothing to write) user=%s", str(cognito_user_id)[:8])
         return 0
     table = _get_resource().Table(USER_VITALS_TABLE)
     client = table.meta.client
@@ -303,6 +305,11 @@ def save_payloads_to_user_vitals(cognito_user_id: str, payloads: list[dict]) -> 
             by_key[item_key] = item
 
     if not by_key:
+        logger.info(
+            "user_vitals save: %d payload(s), 0 keys (payloads had no vitals) user=%s",
+            len(payloads),
+            str(cognito_user_id)[:8],
+        )
         return 0
 
     keys = [{"user_id": cognito_user_id, "item_key": k} for k in by_key.keys()]
@@ -340,6 +347,12 @@ def save_payloads_to_user_vitals(cognito_user_id: str, payloads: list[dict]) -> 
         to_put.append(item)
 
     if not to_put:
+        logger.info(
+            "user_vitals save: payloads=%d keys=%d all values unchanged (no put) user=%s",
+            len(payloads),
+            len(by_key),
+            str(cognito_user_id)[:8],
+        )
         return 0
 
     try:
