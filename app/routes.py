@@ -319,6 +319,7 @@ def sync_fitbit_data():
                 refresh_token=item.get('refresh_token') or '',
                 last_sync=None,
                 cognito_user_id=str(cognito_user_id),
+                token_expires_at_ms=_fitbit_token_expires_at_ms_from_item(item),
             )
             success, parsed_data = _fetch_and_store_fitbit_data(dyn_user)
             rows_written = 0
@@ -386,6 +387,19 @@ def sync_fitbit_data():
         return jsonify({'success': False, 'error': _client_safe_error_detail(e, 500)}), 500
 
 
+def _fitbit_token_expires_at_ms_from_item(item: Optional[dict]) -> Optional[int]:
+    """Dynamo ``expires_at`` may be int or Decimal; used for proactive OAuth refresh."""
+    if not item:
+        return None
+    v = item.get("expires_at")
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def _sync_fitbit_dynamo_user_worker(
     cognito_user_id: str, extra_notification_dates: Optional[Set[str]] = None
 ) -> None:
@@ -410,6 +424,7 @@ def _sync_fitbit_dynamo_user_worker(
             refresh_token=item.get('refresh_token') or '',
             last_sync=None,
             cognito_user_id=str(cognito_user_id),
+            token_expires_at_ms=_fitbit_token_expires_at_ms_from_item(item),
         )
         success, parsed_data = _fetch_and_store_fitbit_data(
             dyn_user, extra_fetch_dates=extra_notification_dates
@@ -954,6 +969,12 @@ def _fetch_and_store_fitbit_data(user, extra_fetch_dates: Optional[Set[str]] = N
         def _tok():
             return user.access_token
 
+        if isinstance(user, SimpleNamespace):
+            from .fitbit_client import maybe_refresh_expiring_fitbit_token
+
+            setattr(user, "_fitbit_oauth_error", False)
+            maybe_refresh_expiring_fitbit_token(user)
+
         # Parallel Fitbit HTTP for Dynamo-only user objects (no concurrent SQLAlchemy token refresh).
         if isinstance(user, SimpleNamespace):
             raw = _fitbit_download_parallel(app._get_current_object(), user, parse_response)
@@ -998,6 +1019,12 @@ def _fetch_and_store_fitbit_data(user, extra_fetch_dates: Optional[Set[str]] = N
         parsed = _fitbit_merge_raw_responses(raw)
         if extra_fetch_dates:
             parsed = _fitbit_merge_notification_dates(parsed, user, parse_response, extra_fetch_dates)
+        if isinstance(user, SimpleNamespace) and getattr(user, "_fitbit_oauth_error", False):
+            logger.warning(
+                "Fitbit sync incomplete: OAuth refresh failed or requests remained unauthorized. "
+                "Reconnect Fitbit in the app; confirm server FITBIT_CLIENT_ID / FITBIT_CLIENT_SECRET match dev.fitbit.com."
+            )
+            return False, None
         return True, parsed
     except Exception as e:
         logger.error("Error fetching Fitbit data: %s", e)

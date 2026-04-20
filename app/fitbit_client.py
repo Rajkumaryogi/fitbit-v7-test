@@ -56,16 +56,130 @@ def refresh_access_token(refresh_token):
     resp = requests.post(token_url, data=data, headers=headers)
     logger.debug("REFRESH TOKEN RESP: %s %s", resp.status_code, resp.text[:500])
     try:
-        return resp.json()
+        body = resp.json()
     except Exception:
-        return {'error': 'invalid_json', 'raw': resp.text}
+        logger.warning(
+            "Fitbit refresh token response not JSON: HTTP %s body=%s",
+            resp.status_code,
+            (resp.text[:400] + "...") if len(resp.text) > 400 else resp.text,
+        )
+        return {"error": "invalid_json", "raw": resp.text, "status_code": resp.status_code}
+    if resp.status_code != 200 or "access_token" not in body:
+        err = body.get("errors") or body.get("error") or body.get("error_description")
+        logger.warning(
+            "Fitbit refresh failed: HTTP %s error=%s body_prefix=%s",
+            resp.status_code,
+            str(err)[:400] if err else "",
+            str(body)[:400],
+        )
+    return body
+
+
+def _persist_refreshed_tokens(user_obj, refreshed: dict) -> None:
+    """Apply refresh response to user_obj, Dynamo (Cognito), and SQLite (User). Caller holds _fitbit_oauth_lock."""
+    new_access = refreshed["access_token"]
+    new_refresh = refreshed.get("refresh_token", user_obj.refresh_token)
+    user_obj.access_token = new_access
+    user_obj.refresh_token = new_refresh
+    expires_in = int(refreshed.get("expires_in", 28800))
+    now_ms = int(time.time() * 1000)
+    new_exp_ms = now_ms + expires_in * 1000
+    if hasattr(user_obj, "token_expires_at_ms"):
+        try:
+            user_obj.token_expires_at_ms = int(new_exp_ms)
+        except (TypeError, ValueError):
+            pass
+    cognito_id = getattr(user_obj, "cognito_user_id", None)
+    if cognito_id:
+        try:
+            from . import dynamodb_client
+
+            dynamodb_client.save_tokens(
+                str(cognito_id),
+                new_access,
+                new_refresh,
+                expires_in,
+                fitbit_user_id=getattr(user_obj, "fitbit_user_id", None),
+            )
+            logger.info("Persisted Fitbit refresh to DynamoDB for user %s", str(cognito_id)[:8])
+        except Exception as e:
+            logger.warning("DynamoDB save_tokens after Fitbit refresh failed: %s", e)
+    try:
+        from .models import User
+
+        if isinstance(user_obj, User):
+            db.session.add(user_obj)
+            db.session.commit()
+            logger.info("Updated user tokens in SQLite after refresh")
+    except Exception as e:
+        db.session.rollback()
+        logger.warning("DB commit error updating tokens: %s", e)
+
+
+def _refresh_fitbit_tokens_unlocked(user_obj) -> bool:
+    """Exchange refresh_token for new access_token. Returns False if Fitbit rejected the request."""
+    rt = getattr(user_obj, "refresh_token", None) or ""
+    if not str(rt).strip():
+        logger.warning("Fitbit refresh skipped: empty refresh_token on user object")
+        setattr(user_obj, "_fitbit_oauth_error", True)
+        return False
+    refreshed = refresh_access_token(user_obj.refresh_token)
+    if "access_token" not in refreshed:
+        setattr(user_obj, "_fitbit_oauth_error", True)
+        return False
+    setattr(user_obj, "_fitbit_oauth_error", False)
+    _persist_refreshed_tokens(user_obj, refreshed)
+    return True
+
+
+def maybe_refresh_expiring_fitbit_token(user_obj, *, skew_ms: int = 300_000) -> None:
+    """
+    If ``token_expires_at_ms`` is set and the access token is expired or within ``skew_ms`` of expiry,
+    refresh once under the OAuth lock (avoids dozens of parallel 401s each attempting refresh).
+    """
+    exp = getattr(user_obj, "token_expires_at_ms", None)
+    if exp is None:
+        return
+    try:
+        exp_i = int(exp)
+    except (TypeError, ValueError):
+        return
+    now_ms = int(time.time() * 1000)
+    if now_ms < exp_i - skew_ms:
+        return
+    rt = getattr(user_obj, "refresh_token", None) or ""
+    if not str(rt).strip():
+        logger.warning(
+            "Fitbit access token expired (expires_at=%s) but refresh_token is empty; reconnect OAuth",
+            exp_i,
+        )
+        setattr(user_obj, "_fitbit_oauth_error", True)
+        return
+    with _fitbit_oauth_lock:
+        exp = getattr(user_obj, "token_expires_at_ms", None)
+        try:
+            exp_i = int(exp) if exp is not None else None
+        except (TypeError, ValueError):
+            exp_i = None
+        if exp_i is not None and int(time.time() * 1000) < exp_i - skew_ms:
+            return
+        if not _refresh_fitbit_tokens_unlocked(user_obj):
+            logger.warning(
+                "Fitbit proactive refresh failed (expired access token). Reconnect Fitbit or verify "
+                "FITBIT_CLIENT_ID / FITBIT_CLIENT_SECRET on the server."
+            )
+
 
 # low-level GET with logging + single retry after refresh
 def _get_with_retry(url, access_token, user_obj=None):
     headers = {'Authorization': f'Bearer {access_token}'}
     resp = requests.get(url, headers=headers, timeout=45)
     logger.debug("GET %s -> %s", url, resp.status_code)
-    if resp.status_code == 401 and user_obj and getattr(user_obj, "refresh_token", None):
+    if resp.status_code == 401 and user_obj:
+        rt401 = getattr(user_obj, "refresh_token", None) or ""
+        if not str(rt401).strip():
+            setattr(user_obj, "_fitbit_oauth_error", True)
+            return resp
         with _fitbit_oauth_lock:
             # Another thread may have refreshed already — retry with latest bearer first.
             latest = getattr(user_obj, "access_token", None) or access_token
@@ -74,40 +188,10 @@ def _get_with_retry(url, access_token, user_obj=None):
             logger.debug("GET after lock (maybe refreshed peer) %s -> %s", url, resp.status_code)
             if resp.status_code != 401:
                 return resp
-            refreshed = refresh_access_token(user_obj.refresh_token)
-            if "access_token" not in refreshed:
+            if not _refresh_fitbit_tokens_unlocked(user_obj):
                 logger.warning("Fitbit token refresh failed for GET %s", url[:120])
                 return resp
-            new_access = refreshed["access_token"]
-            new_refresh = refreshed.get("refresh_token", user_obj.refresh_token)
-            user_obj.access_token = new_access
-            user_obj.refresh_token = new_refresh
-            cognito_id = getattr(user_obj, "cognito_user_id", None)
-            if cognito_id:
-                try:
-                    from . import dynamodb_client
-
-                    dynamodb_client.save_tokens(
-                        str(cognito_id),
-                        new_access,
-                        new_refresh,
-                        int(refreshed.get("expires_in", 28800)),
-                        fitbit_user_id=getattr(user_obj, "fitbit_user_id", None),
-                    )
-                    logger.info("Persisted Fitbit refresh to DynamoDB for user %s", str(cognito_id)[:8])
-                except Exception as e:
-                    logger.warning("DynamoDB save_tokens after Fitbit refresh failed: %s", e)
-            try:
-                from .models import User
-
-                if isinstance(user_obj, User):
-                    db.session.add(user_obj)
-                    db.session.commit()
-                    logger.info("Updated user tokens in SQLite after refresh")
-            except Exception as e:
-                db.session.rollback()
-                logger.warning("DB commit error updating tokens: %s", e)
-            headers = {"Authorization": f"Bearer {new_access}"}
+            headers = {"Authorization": f"Bearer {user_obj.access_token}"}
             resp = requests.get(url, headers=headers, timeout=45)
             logger.debug("RETRY GET %s -> %s", url, resp.status_code)
     return resp
