@@ -99,6 +99,7 @@ def save_tokens(
 
 def get_tokens(user_id: str) -> Optional[dict]:
     """Get Fitbit tokens for a Cognito user. Tries {user_id}#fitbit first, falls back to bare user_id (old format)."""
+    global _ddb_resource
     table = _get_resource().Table(TOKENS_TABLE)
     try:
         r = table.get_item(Key={"userId": _fitbit_key(user_id)})
@@ -111,7 +112,17 @@ def get_tokens(user_id: str) -> Optional[dict]:
             return item2
         return None
     except ClientError as e:
-        logger.warning("get_tokens failed: %s", e)
+        code = (e.response or {}).get("Error", {}).get("Code", "") or ""
+        if code in ("ExpiredTokenException", "UnrecognizedClientException", "InvalidClientTokenId"):
+            logger.error(
+                "get_tokens failed (%s): refresh AWS credentials (e.g. rotate "
+                "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN on Render, or use an IAM role). %s",
+                code,
+                e,
+            )
+            _ddb_resource = None
+        else:
+            logger.warning("get_tokens failed: %s", e)
         return None
 
 

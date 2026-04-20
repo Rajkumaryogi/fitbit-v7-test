@@ -1,6 +1,7 @@
 import os
 import random
 import requests
+from typing import Optional
 import base64
 import logging
 import re
@@ -15,6 +16,8 @@ logger = logging.getLogger(__name__)
 
 # Serialize Fitbit OAuth refresh + Dynamo persistence when many parallel GETs hit 401.
 _fitbit_oauth_lock = threading.Lock()
+_fitbit_http_sem: Optional[threading.Semaphore] = None
+_fitbit_http_sem_lock = threading.Lock()
 # Suppress identical refresh failure spam when many parallel GETs each hit 401.
 _refresh_failure_log_key: str = ""
 _refresh_failure_log_ts: float = 0.0
@@ -239,10 +242,21 @@ def maybe_refresh_expiring_fitbit_token(user_obj, *, skew_ms: int = 300_000) -> 
             )
 
 
+def _fitbit_outbound_semaphore() -> threading.Semaphore:
+    """Limit concurrent Fitbit REST calls process-wide (ThreadPoolExecutor still fans out)."""
+    global _fitbit_http_sem
+    if _fitbit_http_sem is None:
+        with _fitbit_http_sem_lock:
+            if _fitbit_http_sem is None:
+                n = max(1, int(os.getenv("FITBIT_GLOBAL_CONCURRENCY", "2")))
+                _fitbit_http_sem = threading.Semaphore(n)
+    return _fitbit_http_sem
+
+
 def _fitbit_sleep_after_429(resp: requests.Response, attempt: int) -> None:
     """Honor Retry-After when present; otherwise exponential backoff with light jitter."""
     cap = 120.0
-    base = float(os.getenv("FITBIT_429_BACKOFF_BASE", "1.25"))
+    base = float(os.getenv("FITBIT_429_BACKOFF_BASE", "2.0"))
     ra = resp.headers.get("Retry-After")
     try:
         wait = float(ra) if ra is not None and str(ra).strip() != "" else base * (2 ** (attempt - 1))
@@ -254,16 +268,21 @@ def _fitbit_sleep_after_429(resp: requests.Response, attempt: int) -> None:
 
 
 def _fitbit_get(url: str, headers: dict, *, max_429_retries: int = -1) -> requests.Response:
-    """GET with 429 backoff (parallel webhook syncs can otherwise exhaust Fitbit client limits)."""
+    """GET with process-wide concurrency cap and 429 backoff."""
     if max_429_retries < 0:
-        max_429_retries = int(os.getenv("FITBIT_429_MAX_RETRIES", "6"))
+        max_429_retries = int(os.getenv("FITBIT_429_MAX_RETRIES", "4"))
     attempt_429 = 0
+    sem = _fitbit_outbound_semaphore()
     while True:
-        resp = requests.get(url, headers=headers, timeout=45)
+        sem.acquire()
+        try:
+            resp = requests.get(url, headers=headers, timeout=45)
+        finally:
+            sem.release()
         logger.debug("GET %s -> %s", url, resp.status_code)
         if resp.status_code == 429 and attempt_429 < max_429_retries:
             attempt_429 += 1
-            logger.info(
+            logger.debug(
                 "Fitbit API 429; backoff attempt %s/%s url=%s",
                 attempt_429,
                 max_429_retries,
@@ -271,6 +290,12 @@ def _fitbit_get(url: str, headers: dict, *, max_429_retries: int = -1) -> reques
             )
             _fitbit_sleep_after_429(resp, attempt_429)
             continue
+        if resp.status_code == 429 and attempt_429 >= max_429_retries:
+            logger.warning(
+                "Fitbit API 429 after %s retries url=%s",
+                max_429_retries,
+                (url[:120] + "...") if len(url) > 120 else url,
+            )
         return resp
 
 

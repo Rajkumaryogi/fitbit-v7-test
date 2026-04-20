@@ -943,8 +943,8 @@ def _fitbit_merge_raw_responses(raw: dict) -> dict:
 
 def _fitbit_download_parallel(flask_app, user, parse_response) -> dict:
     """Issue many Fitbit GETs concurrently; always read ``user.access_token`` so OAuth refresh updates apply."""
-    # Default 6: Fitbit rate-limits aggressively; raise via FITBIT_FETCH_PARALLELISM if needed.
-    max_w = max(2, min(16, int(os.getenv("FITBIT_FETCH_PARALLELISM", "6"))))
+    # Default 4; process-wide cap is FITBIT_GLOBAL_CONCURRENCY (see fitbit_client). Tune via env.
+    max_w = max(2, min(12, int(os.getenv("FITBIT_FETCH_PARALLELISM", "4"))))
 
     def run(thunk):
         with flask_app.app_context():
@@ -1013,8 +1013,8 @@ def _fetch_and_store_fitbit_data(user, extra_fetch_dates: Optional[Set[str]] = N
                 if sc is not None and sc >= 400:
                     url = getattr(resp, "url", "") or ""
                     u = (url[:160] + "...") if len(url) > 160 else url
-                    if sc == 404:
-                        logger.debug("Fitbit API HTTP 404 for %s", u)
+                    if sc == 404 or sc == 429:
+                        logger.debug("Fitbit API HTTP %s for %s", sc, u)
                     else:
                         logger.warning("Fitbit API HTTP %s for %s", sc, u)
                     return None
