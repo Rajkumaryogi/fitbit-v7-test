@@ -18,6 +18,11 @@ logger = logging.getLogger(__name__)
 _fitbit_oauth_lock = threading.Lock()
 _fitbit_http_sem: Optional[threading.Semaphore] = None
 _fitbit_http_sem_lock = threading.Lock()
+_fitbit_429_cooldown_lock = threading.Lock()
+_fitbit_429_cooldown_until: float = 0.0
+_fitbit_429_warn_lock = threading.Lock()
+_fitbit_429_warn_window_end: float = 0.0
+_fitbit_429_warn_count: int = 0
 # Suppress identical refresh failure spam when many parallel GETs each hit 401.
 _refresh_failure_log_key: str = ""
 _refresh_failure_log_ts: float = 0.0
@@ -248,9 +253,64 @@ def _fitbit_outbound_semaphore() -> threading.Semaphore:
     if _fitbit_http_sem is None:
         with _fitbit_http_sem_lock:
             if _fitbit_http_sem is None:
-                n = max(1, int(os.getenv("FITBIT_GLOBAL_CONCURRENCY", "2")))
+                # Default 1: Fitbit client + hourly caps are tight; raise via FITBIT_GLOBAL_CONCURRENCY if needed.
+                n = max(1, int(os.getenv("FITBIT_GLOBAL_CONCURRENCY", "1")))
                 _fitbit_http_sem = threading.Semaphore(n)
     return _fitbit_http_sem
+
+
+def _fitbit_enforce_global_cooldown() -> None:
+    """After a hard 429, all outbound GETs wait so parallel tasks do not immediately hammer Fitbit again."""
+    while True:
+        with _fitbit_429_cooldown_lock:
+            until = _fitbit_429_cooldown_until
+        now = time.monotonic()
+        if now >= until:
+            return
+        time.sleep(min(1.5, max(0.05, until - now)))
+
+
+def _fitbit_extend_cooldown_after_hard_429(resp: requests.Response) -> None:
+    """Push back when the next Fitbit GET may start (shared across threads)."""
+    global _fitbit_429_cooldown_until
+    bump = float(os.getenv("FITBIT_429_GLOBAL_COOLDOWN_SEC", "22"))
+    with _fitbit_429_cooldown_lock:
+        na = time.monotonic() + max(5.0, bump)
+        _fitbit_429_cooldown_until = max(_fitbit_429_cooldown_until, na)
+        ra = resp.headers.get("Retry-After")
+        if ra is not None and str(ra).strip():
+            try:
+                ra_f = float(ra)
+                _fitbit_429_cooldown_until = max(
+                    _fitbit_429_cooldown_until, time.monotonic() + max(5.0, ra_f)
+                )
+            except (TypeError, ValueError):
+                pass
+
+
+def _fitbit_log_final_429(url_short: str, max_retries: int) -> None:
+    """One WARNING per ~45s burst; other endpoints at DEBUG (many parallel tasks share one window)."""
+    global _fitbit_429_warn_window_end, _fitbit_429_warn_count
+    now = time.monotonic()
+    with _fitbit_429_warn_lock:
+        if now > _fitbit_429_warn_window_end:
+            _fitbit_429_warn_count = 0
+            _fitbit_429_warn_window_end = now + 45.0
+        _fitbit_429_warn_count += 1
+        n = _fitbit_429_warn_count
+    if n == 1:
+        logger.warning(
+            "Fitbit API 429 after %s retries url=%s (further 429s in ~45s window logged at DEBUG)",
+            max_retries,
+            url_short,
+        )
+    else:
+        logger.debug(
+            "Fitbit API 429 after %s retries url=%s (window count=%s)",
+            max_retries,
+            url_short,
+            n,
+        )
 
 
 def _fitbit_sleep_after_429(resp: requests.Response, attempt: int) -> None:
@@ -273,7 +333,9 @@ def _fitbit_get(url: str, headers: dict, *, max_429_retries: int = -1) -> reques
         max_429_retries = int(os.getenv("FITBIT_429_MAX_RETRIES", "4"))
     attempt_429 = 0
     sem = _fitbit_outbound_semaphore()
+    url_short = (url[:120] + "...") if len(url) > 120 else url
     while True:
+        _fitbit_enforce_global_cooldown()
         sem.acquire()
         try:
             resp = requests.get(url, headers=headers, timeout=45)
@@ -286,16 +348,13 @@ def _fitbit_get(url: str, headers: dict, *, max_429_retries: int = -1) -> reques
                 "Fitbit API 429; backoff attempt %s/%s url=%s",
                 attempt_429,
                 max_429_retries,
-                (url[:120] + "...") if len(url) > 120 else url,
+                url_short,
             )
             _fitbit_sleep_after_429(resp, attempt_429)
             continue
         if resp.status_code == 429 and attempt_429 >= max_429_retries:
-            logger.warning(
-                "Fitbit API 429 after %s retries url=%s",
-                max_429_retries,
-                (url[:120] + "...") if len(url) > 120 else url,
-            )
+            _fitbit_extend_cooldown_after_hard_429(resp)
+            _fitbit_log_final_429(url_short, max_429_retries)
         return resp
 
 
