@@ -1,3 +1,5 @@
+import os
+import random
 import requests
 import base64
 import logging
@@ -13,12 +15,22 @@ logger = logging.getLogger(__name__)
 
 # Serialize Fitbit OAuth refresh + Dynamo persistence when many parallel GETs hit 401.
 _fitbit_oauth_lock = threading.Lock()
+# Suppress identical refresh failure spam when many parallel GETs each hit 401.
+_refresh_failure_log_key: str = ""
+_refresh_failure_log_ts: float = 0.0
 
 
 def _scrub_fitbit_refresh_echo(text: str, limit: int = 400) -> str:
     """Fitbit error text can echo the refresh token; redact before logging."""
     s = str(text)[:limit]
-    return re.sub(r"Refresh token invalid:\s*[A-Fa-f0-9]+", "Refresh token invalid: <redacted>", s)
+    s = re.sub(
+        r"(?i)Refresh\s+token\s+invalid:\s*[A-Fa-f0-9]{16,}",
+        "Refresh token invalid: <redacted>",
+        s,
+    )
+    # Fitbit sometimes embeds a 64-char hex in the message string (repr uses quotes).
+    s = re.sub(r"(?<![A-Fa-f0-9])[A-Fa-f0-9]{64}(?![A-Fa-f0-9])", "<redacted>", s)
+    return s
 
 
 def _oauth_body_invalid_grant(body: object) -> bool:
@@ -76,24 +88,42 @@ def refresh_access_token(refresh_token):
         'client_id': client_id
     }
     resp = requests.post(token_url, data=data, headers=headers)
-    logger.debug("REFRESH TOKEN RESP: %s %s", resp.status_code, resp.text[:500])
+    logger.debug(
+        "REFRESH TOKEN RESP: %s %s",
+        resp.status_code,
+        _scrub_fitbit_refresh_echo(resp.text[:500]),
+    )
     try:
         body = resp.json()
     except Exception:
+        raw = (resp.text[:400] + "...") if len(resp.text) > 400 else resp.text
         logger.warning(
             "Fitbit refresh token response not JSON: HTTP %s body=%s",
             resp.status_code,
-            (resp.text[:400] + "...") if len(resp.text) > 400 else resp.text,
+            _scrub_fitbit_refresh_echo(raw),
         )
         return {"error": "invalid_json", "raw": resp.text, "status_code": resp.status_code}
     if resp.status_code != 200 or "access_token" not in body:
         err = body.get("errors") or body.get("error") or body.get("error_description")
-        logger.warning(
-            "Fitbit refresh failed: HTTP %s error=%s body_prefix=%s",
-            resp.status_code,
-            _scrub_fitbit_refresh_echo(str(err)[:400]) if err else "",
-            _scrub_fitbit_refresh_echo(str(body)[:400]),
-        )
+        err_s = _scrub_fitbit_refresh_echo(str(err)[:400]) if err else ""
+        body_s = _scrub_fitbit_refresh_echo(str(body)[:400])
+        global _refresh_failure_log_key, _refresh_failure_log_ts
+        dedupe_key = f"{resp.status_code}|{err_s[:180]}|{body_s[:120]}"
+        now = time.time()
+        if dedupe_key == _refresh_failure_log_key and now - _refresh_failure_log_ts < 45.0:
+            logger.debug(
+                "Fitbit refresh failed (repeat suppressed within 45s): HTTP %s",
+                resp.status_code,
+            )
+        else:
+            _refresh_failure_log_key = dedupe_key
+            _refresh_failure_log_ts = now
+            logger.warning(
+                "Fitbit refresh failed: HTTP %s error=%s body_prefix=%s",
+                resp.status_code,
+                err_s,
+                body_s,
+            )
     return body
 
 
@@ -142,8 +172,8 @@ def _refresh_fitbit_tokens_unlocked(user_obj) -> bool:
     """Exchange refresh_token for new access_token. Returns False if Fitbit rejected the request."""
     rt = getattr(user_obj, "refresh_token", None) or ""
     if not str(rt).strip():
-        logger.warning("Fitbit refresh skipped: empty refresh_token on user object")
         setattr(user_obj, "_fitbit_oauth_error", True)
+        logger.debug("Fitbit refresh skipped: empty refresh_token on user object")
         return False
     refreshed = refresh_access_token(user_obj.refresh_token)
     if "access_token" not in refreshed:
@@ -160,6 +190,11 @@ def _refresh_fitbit_tokens_unlocked(user_obj) -> bool:
                 )
             except Exception as e:
                 logger.warning("remove_tokens after invalid_grant: %s", e)
+            # Stop this request's parallel GETs from hammering the token endpoint with the same dead refresh.
+            user_obj.refresh_token = ""
+            user_obj.access_token = ""
+            if hasattr(user_obj, "token_expires_at_ms"):
+                user_obj.token_expires_at_ms = 0
         return False
     setattr(user_obj, "_fitbit_oauth_error", False)
     _persist_refreshed_tokens(user_obj, refreshed)
@@ -204,11 +239,45 @@ def maybe_refresh_expiring_fitbit_token(user_obj, *, skew_ms: int = 300_000) -> 
             )
 
 
+def _fitbit_sleep_after_429(resp: requests.Response, attempt: int) -> None:
+    """Honor Retry-After when present; otherwise exponential backoff with light jitter."""
+    cap = 120.0
+    base = float(os.getenv("FITBIT_429_BACKOFF_BASE", "1.25"))
+    ra = resp.headers.get("Retry-After")
+    try:
+        wait = float(ra) if ra is not None and str(ra).strip() != "" else base * (2 ** (attempt - 1))
+    except (TypeError, ValueError):
+        wait = base * (2 ** (attempt - 1))
+    wait = min(wait, cap)
+    wait += random.uniform(0, min(2.5, 0.2 * wait))
+    time.sleep(wait)
+
+
+def _fitbit_get(url: str, headers: dict, *, max_429_retries: int = -1) -> requests.Response:
+    """GET with 429 backoff (parallel webhook syncs can otherwise exhaust Fitbit client limits)."""
+    if max_429_retries < 0:
+        max_429_retries = int(os.getenv("FITBIT_429_MAX_RETRIES", "6"))
+    attempt_429 = 0
+    while True:
+        resp = requests.get(url, headers=headers, timeout=45)
+        logger.debug("GET %s -> %s", url, resp.status_code)
+        if resp.status_code == 429 and attempt_429 < max_429_retries:
+            attempt_429 += 1
+            logger.info(
+                "Fitbit API 429; backoff attempt %s/%s url=%s",
+                attempt_429,
+                max_429_retries,
+                (url[:120] + "...") if len(url) > 120 else url,
+            )
+            _fitbit_sleep_after_429(resp, attempt_429)
+            continue
+        return resp
+
+
 # low-level GET with logging + single retry after refresh
 def _get_with_retry(url, access_token, user_obj=None):
     headers = {'Authorization': f'Bearer {access_token}'}
-    resp = requests.get(url, headers=headers, timeout=45)
-    logger.debug("GET %s -> %s", url, resp.status_code)
+    resp = _fitbit_get(url, headers)
     if resp.status_code == 401 and user_obj:
         rt401 = getattr(user_obj, "refresh_token", None) or ""
         if not str(rt401).strip():
@@ -218,15 +287,19 @@ def _get_with_retry(url, access_token, user_obj=None):
             # Another thread may have refreshed already — retry with latest bearer first.
             latest = getattr(user_obj, "access_token", None) or access_token
             headers = {"Authorization": f"Bearer {latest}"}
-            resp = requests.get(url, headers=headers, timeout=45)
+            resp = _fitbit_get(url, headers)
             logger.debug("GET after lock (maybe refreshed peer) %s -> %s", url, resp.status_code)
             if resp.status_code != 401:
                 return resp
             if not _refresh_fitbit_tokens_unlocked(user_obj):
-                logger.warning("Fitbit token refresh failed for GET %s", url[:120])
+                rt_after = getattr(user_obj, "refresh_token", None) or ""
+                if not str(rt_after).strip():
+                    logger.debug("Fitbit GET refresh skipped after invalid_grant (no refresh token): %s", url[:120])
+                else:
+                    logger.warning("Fitbit token refresh failed for GET %s", url[:120])
                 return resp
             headers = {"Authorization": f"Bearer {user_obj.access_token}"}
-            resp = requests.get(url, headers=headers, timeout=45)
+            resp = _fitbit_get(url, headers)
             logger.debug("RETRY GET %s -> %s", url, resp.status_code)
     return resp
 

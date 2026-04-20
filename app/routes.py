@@ -400,6 +400,55 @@ def _fitbit_token_expires_at_ms_from_item(item: Optional[dict]) -> Optional[int]
         return None
 
 
+# Serialize Fitbit webhook-triggered sync per Cognito user so overlapping POSTs do not
+# each fan out ~34 parallel Fitbit GETs (429 + slow responses + Fitbit subscriber timeouts).
+_fitbit_webhook_queue: dict[str, Set[str]] = {}
+_fitbit_webhook_queue_lock = threading.Lock()
+_fitbit_webhook_user_locks: dict[str, threading.Lock] = {}
+_fitbit_webhook_user_locks_guard = threading.Lock()
+
+
+def _fitbit_webhook_user_lock(cognito_user_id: str) -> threading.Lock:
+    cid = str(cognito_user_id)
+    with _fitbit_webhook_user_locks_guard:
+        lk = _fitbit_webhook_user_locks.get(cid)
+        if lk is None:
+            lk = threading.Lock()
+            _fitbit_webhook_user_locks[cid] = lk
+        return lk
+
+
+def _fitbit_webhook_enqueue_sync(
+    cognito_user_id: str, flask_app, extra_notification_dates: Optional[Set[str]] = None
+) -> None:
+    cid = str(cognito_user_id)
+    inc: Set[str] = set(extra_notification_dates) if extra_notification_dates else set()
+    with _fitbit_webhook_queue_lock:
+        prev = _fitbit_webhook_queue.get(cid, set())
+        _fitbit_webhook_queue[cid] = prev | inc
+    threading.Thread(
+        target=_fitbit_webhook_drain_one_user,
+        args=(cid, flask_app),
+        daemon=True,
+        name=f"fitbit-webhook-{cid[:8]}",
+    ).start()
+
+
+def _fitbit_webhook_drain_one_user(cognito_user_id: str, flask_app) -> None:
+    lk = _fitbit_webhook_user_lock(cognito_user_id)
+    with lk:
+        with flask_app.app_context():
+            while True:
+                with _fitbit_webhook_queue_lock:
+                    dates = _fitbit_webhook_queue.pop(cognito_user_id, None)
+                if dates is None:
+                    break
+                _sync_fitbit_dynamo_user_worker(
+                    cognito_user_id,
+                    extra_notification_dates=dates if dates else None,
+                )
+
+
 def _sync_fitbit_dynamo_user_worker(
     cognito_user_id: str, extra_notification_dates: Optional[Set[str]] = None
 ) -> None:
@@ -484,7 +533,8 @@ def fitbit_subscriber_webhook():
     - Configure this **exact** URL in https://dev.fitbit.com/apps (Subscriber URL, JSON).
     - Subscriber verification: GET ``?verify=`` — respond **204** for the code shown in the portal,
       **404** for any other value (see Fitbit "Verify a Subscriber").
-    - Notifications: POST JSON array — respond **204** within 5s; sync runs in a background thread.
+    - Notifications: POST JSON array — respond **204** within 5s; sync runs in background threads,
+      **serialized per Cognito user** with a small queue so burst notifications do not overlap full fetches.
     """
     if request.method == 'OPTIONS':
         return '', 200
@@ -548,13 +598,19 @@ def fitbit_subscriber_webhook():
 
         def _run_all():
             with flask_app.app_context():
+                cid_dates: dict[str, Set[str]] = {}
                 for oid in owner_ids:
                     cid = dynamodb_client.get_cognito_id_by_fitbit_owner_id(oid)
-                    if cid:
-                        extra_dates = owner_notification_dates.get(oid) or None
-                        _sync_fitbit_dynamo_user_worker(cid, extra_notification_dates=extra_dates)
-                    else:
+                    if not cid:
                         logger.warning('Fitbit webhook: no DynamoDB Fitbit row for ownerId=%s', oid[:12])
+                        continue
+                    nd = owner_notification_dates.get(oid)
+                    if cid not in cid_dates:
+                        cid_dates[cid] = set()
+                    if nd:
+                        cid_dates[cid].update(nd)
+                for cid, dates in cid_dates.items():
+                    _fitbit_webhook_enqueue_sync(cid, flask_app, dates if dates else None)
 
         if owner_ids:
             threading.Thread(target=_run_all, daemon=True, name='fitbit-webhook-sync').start()
@@ -887,7 +943,8 @@ def _fitbit_merge_raw_responses(raw: dict) -> dict:
 
 def _fitbit_download_parallel(flask_app, user, parse_response) -> dict:
     """Issue many Fitbit GETs concurrently; always read ``user.access_token`` so OAuth refresh updates apply."""
-    max_w = max(4, min(20, int(os.getenv("FITBIT_FETCH_PARALLELISM", "12"))))
+    # Default 6: Fitbit rate-limits aggressively; raise via FITBIT_FETCH_PARALLELISM if needed.
+    max_w = max(2, min(16, int(os.getenv("FITBIT_FETCH_PARALLELISM", "6"))))
 
     def run(thunk):
         with flask_app.app_context():
@@ -955,9 +1012,11 @@ def _fetch_and_store_fitbit_data(user, extra_fetch_dates: Optional[Set[str]] = N
                 sc = getattr(resp, "status_code", None)
                 if sc is not None and sc >= 400:
                     url = getattr(resp, "url", "") or ""
-                    logger.warning(
-                        "Fitbit API HTTP %s for %s", sc, (url[:160] + "...") if len(url) > 160 else url
-                    )
+                    u = (url[:160] + "...") if len(url) > 160 else url
+                    if sc == 404:
+                        logger.debug("Fitbit API HTTP 404 for %s", u)
+                    else:
+                        logger.warning("Fitbit API HTTP %s for %s", sc, u)
                     return None
                 if hasattr(resp, "json"):
                     return resp.json()
