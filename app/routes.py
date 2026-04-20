@@ -393,6 +393,10 @@ def _sync_fitbit_dynamo_user_worker(cognito_user_id: str) -> None:
             return
         fitbit_uid = item.get('fitbit_user_id')
         if not fitbit_uid:
+            logger.warning(
+                'Fitbit webhook: DynamoDB token row missing fitbit_user_id for user %s; reconnect OAuth',
+                cognito_user_id[:8],
+            )
             return
         from types import SimpleNamespace
         dyn_user = SimpleNamespace(
@@ -409,6 +413,11 @@ def _sync_fitbit_dynamo_user_worker(cognito_user_id: str) -> None:
                 n = _save_fitbit_to_user_vitals(cognito_user_id, parsed_data)
                 if n > 0:
                     dynamodb_client.update_last_vitals7_push_at(cognito_user_id, int(_time.time() * 1000))
+                else:
+                    logger.info(
+                        'Fitbit webhook: user_vitals write skipped (0 changed rows) for user %s',
+                        cognito_user_id[:8],
+                    )
             except Exception as e:
                 logger.warning('DynamoDB user_vitals (webhook sync): %s', e)
         if success:
@@ -420,7 +429,14 @@ def _sync_fitbit_dynamo_user_worker(cognito_user_id: str) -> None:
 
 def _fitbit_notifications_from_request():
     """Parse JSON array, single JSON object, or multipart ``updates`` field (Fitbit subscriber docs)."""
-    data = request.get_json(silent=True)
+    data = request.get_json(silent=True, force=True)
+    if data is None and request.data:
+        try:
+            raw = request.get_data(as_text=True)
+            if raw and raw.strip():
+                data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            data = None
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
@@ -467,15 +483,20 @@ def fitbit_subscriber_webhook():
         return '', 404
     try:
         notifications = _fitbit_notifications_from_request()
+        if not notifications and request.method == 'POST' and request.data:
+            logger.warning(
+                'Fitbit webhook: POST had body (%d bytes) but parsed 0 notifications; check Content-Type/JSON',
+                len(request.data or b''),
+            )
         owner_ids = set()
         for n in notifications:
             if not isinstance(n, dict):
                 continue
             col = (n.get('collectionType') or '').strip()
-            oid = n.get('ownerId')
-            if not oid:
+            oid = n.get('ownerId') or n.get('ownerid')
+            if oid is None or (isinstance(oid, str) and not oid.strip()):
                 continue
-            oid_s = str(oid)
+            oid_s = str(oid).strip()
             if col == 'userRevokedAccess':
                 cid = dynamodb_client.get_cognito_id_by_fitbit_owner_id(oid_s)
                 if cid:

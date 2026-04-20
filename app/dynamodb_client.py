@@ -151,23 +151,38 @@ def get_cognito_id_by_fitbit_owner_id(fitbit_owner_id: str) -> Optional[str]:
     """
     Find Cognito user id for a Fitbit ownerId (Subscriber API notifications).
     Scans TOKENS_TABLE for api_name Fitbit and matching fitbit_user_id.
+
+    Paginates the full table: a single scan page can miss the row (DynamoDB 1MB
+    limit per scan) which would break webhooks while still returning 204.
     """
     if not fitbit_owner_id:
         return None
+    fid = str(fitbit_owner_id).strip()
+    if not fid:
+        return None
     try:
         table = _get_resource().Table(TOKENS_TABLE)
-        r = table.scan(
-            FilterExpression="api_name = :fn AND fitbit_user_id = :fid",
-            ExpressionAttributeValues={":fn": "Fitbit", ":fid": str(fitbit_owner_id)},
-            ProjectionExpression="userId, cognito_user_id",
-        )
-        for it in r.get("Items", []):
-            cid = it.get("cognito_user_id")
-            if cid:
-                return str(cid)
-            uid = it.get("userId") or ""
-            if isinstance(uid, str) and uid.endswith(FITBIT_KEY_SUFFIX):
-                return uid[: -len(FITBIT_KEY_SUFFIX)]
+        # Case variants on api_name; ownerId must match stored fitbit_user_id string.
+        kwargs: dict[str, Any] = {
+            "FilterExpression": "(api_name = :a OR api_name = :b) AND fitbit_user_id = :fid",
+            "ExpressionAttributeValues": {":a": "Fitbit", ":b": "fitbit", ":fid": fid},
+            "ProjectionExpression": "userId, cognito_user_id, fitbit_user_id",
+        }
+        start_key = None
+        while True:
+            if start_key:
+                kwargs["ExclusiveStartKey"] = start_key
+            r = table.scan(**kwargs)
+            for it in r.get("Items", []):
+                cid = it.get("cognito_user_id")
+                if cid:
+                    return str(cid)
+                uid = it.get("userId") or ""
+                if isinstance(uid, str) and uid.endswith(FITBIT_KEY_SUFFIX):
+                    return uid[: -len(FITBIT_KEY_SUFFIX)]
+            start_key = r.get("LastEvaluatedKey")
+            if not start_key:
+                break
         return None
     except Exception as e:
         logger.warning("get_cognito_id_by_fitbit_owner_id failed: %s", e)
