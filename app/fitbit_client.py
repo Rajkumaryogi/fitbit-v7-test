@@ -1,6 +1,7 @@
 import requests
 import base64
 import logging
+import re
 import threading
 from flask import current_app
 from .auth import generate_pkce
@@ -12,6 +13,27 @@ logger = logging.getLogger(__name__)
 
 # Serialize Fitbit OAuth refresh + Dynamo persistence when many parallel GETs hit 401.
 _fitbit_oauth_lock = threading.Lock()
+
+
+def _scrub_fitbit_refresh_echo(text: str, limit: int = 400) -> str:
+    """Fitbit error text can echo the refresh token; redact before logging."""
+    s = str(text)[:limit]
+    return re.sub(r"Refresh token invalid:\s*[A-Fa-f0-9]+", "Refresh token invalid: <redacted>", s)
+
+
+def _oauth_body_invalid_grant(body: object) -> bool:
+    if not isinstance(body, dict):
+        return False
+    if str(body.get("error", "")).lower() == "invalid_grant":
+        return True
+    errs = body.get("errors")
+    if not isinstance(errs, list):
+        return False
+    for e in errs:
+        if isinstance(e, dict) and str(e.get("errorType", "")).lower() == "invalid_grant":
+            return True
+    return False
+
 
 def _basic_auth_header(client_id, client_secret):
     creds = f"{client_id}:{client_secret}"
@@ -69,8 +91,8 @@ def refresh_access_token(refresh_token):
         logger.warning(
             "Fitbit refresh failed: HTTP %s error=%s body_prefix=%s",
             resp.status_code,
-            str(err)[:400] if err else "",
-            str(body)[:400],
+            _scrub_fitbit_refresh_echo(str(err)[:400]) if err else "",
+            _scrub_fitbit_refresh_echo(str(body)[:400]),
         )
     return body
 
@@ -126,6 +148,18 @@ def _refresh_fitbit_tokens_unlocked(user_obj) -> bool:
     refreshed = refresh_access_token(user_obj.refresh_token)
     if "access_token" not in refreshed:
         setattr(user_obj, "_fitbit_oauth_error", True)
+        cognito_id = getattr(user_obj, "cognito_user_id", None)
+        if cognito_id and _oauth_body_invalid_grant(refreshed):
+            try:
+                from . import dynamodb_client
+
+                dynamodb_client.remove_tokens(str(cognito_id))
+                logger.info(
+                    "Removed Fitbit token row from DynamoDB for user %s (invalid_grant; reconnect Fitbit).",
+                    str(cognito_id)[:8],
+                )
+            except Exception as e:
+                logger.warning("remove_tokens after invalid_grant: %s", e)
         return False
     setattr(user_obj, "_fitbit_oauth_error", False)
     _persist_refreshed_tokens(user_obj, refreshed)
@@ -164,9 +198,9 @@ def maybe_refresh_expiring_fitbit_token(user_obj, *, skew_ms: int = 300_000) -> 
         if exp_i is not None and int(time.time() * 1000) < exp_i - skew_ms:
             return
         if not _refresh_fitbit_tokens_unlocked(user_obj):
-            logger.warning(
-                "Fitbit proactive refresh failed (expired access token). Reconnect Fitbit or verify "
-                "FITBIT_CLIENT_ID / FITBIT_CLIENT_SECRET on the server."
+            logger.info(
+                "Fitbit proactive refresh did not obtain a new access token (see prior refresh log). "
+                "If not invalid_grant, verify FITBIT_CLIENT_ID / FITBIT_CLIENT_SECRET."
             )
 
 

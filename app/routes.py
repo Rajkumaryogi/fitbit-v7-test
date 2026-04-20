@@ -974,6 +974,11 @@ def _fetch_and_store_fitbit_data(user, extra_fetch_dates: Optional[Set[str]] = N
 
             setattr(user, "_fitbit_oauth_error", False)
             maybe_refresh_expiring_fitbit_token(user)
+            if getattr(user, "_fitbit_oauth_error", False):
+                logger.warning(
+                    "Skipping Fitbit resource fetch after failed proactive token refresh (reconnect Fitbit)."
+                )
+                return False, None
 
         # Parallel Fitbit HTTP for Dynamo-only user objects (no concurrent SQLAlchemy token refresh).
         if isinstance(user, SimpleNamespace):
